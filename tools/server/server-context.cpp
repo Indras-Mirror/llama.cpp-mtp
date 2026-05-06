@@ -82,6 +82,8 @@ struct server_slot {
 
     llama_context * ctx = nullptr;
 
+    bool is_mtp_enabled = false;
+
     common_context_seq_rm_type ctx_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     // multimodal
@@ -157,6 +159,10 @@ struct server_slot {
         return res;
     }
 
+    bool is_mtp() const { return is_mtp_enabled; }
+
+    bool need_embd() const { return task->need_embd() || is_mtp(); }
+
     void prompt_clear(bool allow_processing) {
         if (!allow_processing) {
             GGML_ASSERT(!is_processing());
@@ -164,7 +170,7 @@ struct server_slot {
 
         SLT_INF(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
-        llama_memory_seq_rm(llama_get_memory(ctx), id, -1, -1);
+        llama_context_seq_rm(ctx, id, -1, -1);
         prompt.tokens.clear();
     }
 
@@ -346,7 +352,7 @@ struct server_slot {
             const auto & params_spec = task->params.speculative;
 
             if (!spec_draft.empty()) {
-                // we have a previous (partial) draft to reuse
+                // we have a previous (partial) draft to reuse from the FULL
                 if (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
                     GGML_ASSERT(!spec_ckpt.empty());
                 }
@@ -550,7 +556,7 @@ struct server_slot {
     void copy_state_to(server_slot & other) const {
         GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
 
-        llama_memory_seq_rm(llama_get_memory(ctx), other.id,     -1, -1);
+        llama_context_seq_rm(ctx, other.id, -1, -1);
         llama_memory_seq_cp(llama_get_memory(ctx), id, other.id, -1, -1);
 
         other.n_decoded   = n_decoded;
@@ -674,6 +680,8 @@ private:
     llama_batch batch {};
 
     llama_model_ptr model_dft;
+
+    llama_model_ptr model_mtp;
 
     bool add_bos_token = true;
 
@@ -807,6 +815,57 @@ private:
 
             params_base.speculative.draft.model = model_dft.get();
             params_base.speculative.draft.cparams = common_context_params_to_llama(params_dft);
+            params_base.speculative.draft.cparams.n_rs_seq = 0;
+        }
+
+        //TODO: generalize if this is ok, we should load <arch_name>_mtp arch?
+        if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_MTP) {
+            char trunk_arch[64] = {0};
+            llama_model_meta_val_str(model, "general.architecture", trunk_arch, sizeof(trunk_arch));
+
+            const char * mtp_arch = nullptr;
+            if (std::string(trunk_arch) == "qwen35moe") {
+                mtp_arch = "qwen35moe_mtp";
+            } else if (std::string(trunk_arch) == "qwen35") {
+                mtp_arch = "qwen35_mtp";
+            } else {
+                SRV_ERR("MTP not supported for trunk architecture '%s'\n", trunk_arch);
+                return false;
+            }
+
+            SRV_INF("loading MTP head from '%s' (override_arch=%s)\n",
+                    params_base.model.path.c_str(), mtp_arch);
+
+            auto mparams_mtp = common_model_params_to_llama(params_base);
+            mparams_mtp.override_arch = mtp_arch;
+
+            model_mtp.reset(llama_model_load_from_file(params_base.model.path.c_str(), mparams_mtp));
+            if (model_mtp == nullptr) {
+                SRV_ERR("failed to load MTP head from '%s'\n", params_base.model.path.c_str());
+                return false;
+            }
+
+            if (params_base.n_parallel > 1) {
+                SRV_ERR("MTP currently supports only n_parallel=1; got %d\n", params_base.n_parallel);
+                return false;
+            }
+
+            auto cparams_mtp = common_context_params_to_llama(params_base);
+            cparams_mtp.n_ctx     = llama_n_ctx_seq(ctx);
+            cparams_mtp.n_seq_max = 1;
+            cparams_mtp.n_rs_seq = 0;
+
+            params_base.speculative.mtp.model   = model_mtp.get();
+            params_base.speculative.mtp.cparams = cparams_mtp;
+
+            if (params_base.n_cache_reuse) {
+                params_base.n_cache_reuse = 0;
+                SRV_WRN("%s\n", "cache_reuse is not supported with MTP, it will be disabled");
+            }
+            if (params_base.ctx_shift) {
+                params_base.ctx_shift = false;
+                SRV_WRN("%s\n", "ctx_shift is not supported with MTP, it will be disabled");
+            }
         }
 
         std::string & mmproj_path = params_base.mmproj.path;
@@ -909,6 +968,7 @@ private:
 
             // try speculative decoding
             if (ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+                slot.is_mtp_enabled = params_base.speculative.has_mtp();
                 slot.spec.reset(common_speculative_init(params_base.speculative, slot.ctx));
 
                 if (slot.spec) {
@@ -2201,7 +2261,12 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
-                llama_memory_seq_rm (llama_get_memory(ctx), slot.id, n_keep            , n_keep + n_discard);
+                // ctx_shift is disabled for MTP slots at server startup; if
+                // we're here with a registered ctx_mtp, the seq_add below
+                // would desync ctx_mtp's KV from the trunk's. Fail loudly.
+                GGML_ASSERT(!slot.is_mtp()
+                            && "ctx_shift path entered for MTP slot — disable check missing");
+                llama_context_seq_rm(ctx, slot.id, n_keep            , n_keep + n_discard);
                 llama_memory_seq_add(llama_get_memory(ctx), slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
 
                 // add generated tokens to cache
@@ -2374,7 +2439,12 @@ private:
 
                                 const bool can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx)) &&
-                                    !slot.prompt.tokens.has_mtmd;
+                                    !slot.prompt.tokens.has_mtmd &&
+                                    // MTP slots: per-request n_cache_reuse can re-enable
+                                    // the path even though we disabled the global flag at
+                                    // startup. The cache-shift uses llama_memory_seq_add
+                                    // which we don't mirror to ctx_mtp, so KV would desync.
+                                    !slot.is_mtp();
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
@@ -2412,7 +2482,12 @@ private:
 
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
 
-                                            llama_memory_seq_rm (llama_get_memory(ctx), slot.id, head_p, head_c);
+                                            // n_cache_reuse is disabled for MTP slots at startup;
+                                            // if we're here with a registered ctx_mtp, the seq_add
+                                            // below would desync ctx_mtp's KV from the trunk's.
+                                            GGML_ASSERT(!slot.is_mtp()
+                                                        && "n_cache_reuse path entered for MTP slot — disable check missing");
+                                            llama_context_seq_rm(ctx, slot.id, head_p, head_c);
                                             llama_memory_seq_add(llama_get_memory(ctx), slot.id, head_c, head_c + n_match, kv_shift);
 
                                             for (size_t i = 0; i < n_match; i++) {
@@ -2576,7 +2651,7 @@ private:
 
                     SLT_INF(slot, "n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, p0, -1)) {
+                    if (!llama_context_seq_rm(ctx, slot.id, p0, -1)) {
                         SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
 
                         slot.prompt_clear(true);
@@ -2608,9 +2683,11 @@ private:
                     // checkpoints are created only if:
                     // - the model does not support partial sequence removal
                     // - the model uses SWA (and we are not using `swa_full`)
+                    // - the model supports partial sequence removal but only up to a fixed bound
                     do_checkpoint = do_checkpoint && (
-                            (slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) ||
-                            (n_swa > 0));
+                            slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL         ||
+                            slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART_BOUNDED ||
+                            n_swa > 0);
 
                     bool has_mtmd = false;
 
@@ -2638,6 +2715,10 @@ private:
                     }
 
                     // add prompt tokens for processing in the current batch
+                    // embedding requires all tokens in the batch to be output;
+                    // MTP also wants logits at every prompt position so the
+                    // streaming hook can mirror t_h_pre_norm into ctx_mtp.
+                    const bool need_embd = slot.need_embd();
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.n_tokens < n_batch) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
@@ -2653,12 +2734,11 @@ private:
                             break;
                         }
 
-                        // embedding requires all tokens in the batch to be output
                         common_batch_add(batch,
                             cur_tok,
                             slot.prompt.tokens.pos_next(),
                             { slot.id },
-                            slot.task->need_embd());
+                            need_embd);
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
@@ -2770,7 +2850,7 @@ private:
                 slot_batched->lora[alora_disabled_id].scale = alora_scale;
             }
 
-            llama_set_embeddings(ctx, slot_batched->task->need_embd());
+            llama_set_embeddings(ctx, slot_batched->need_embd());
         }
 
         if (batch.n_tokens == 0) {
@@ -3014,7 +3094,10 @@ private:
                                         __func__, ckpt.pos_min, ckpt.pos_max, ckpt.size(), ckpt.size(), n);
                             }
 
-                            llama_memory_seq_rm(llama_get_memory(slot.ctx), slot.id, ckpt.pos_max + 1, -1);
+                            // ctx_mtp has no analogous checkpointing — auto-mirror
+                            // wipes its tail; the next prefill ubatch repopulates
+                            // it via the streaming hook.
+                            llama_context_seq_rm(slot.ctx, slot.id, ckpt.pos_max + 1, -1);
 
                             slot.prompt.tokens.keep_first(ckpt.n_tokens);
                             slot.smpl = std::move(smpl_save);
@@ -3049,7 +3132,7 @@ private:
                 slot.sampled = ids.back(); // last accepted token
                 SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-                llama_memory_seq_rm(llama_get_memory(slot.ctx), slot.id, slot.prompt.tokens.pos_next(), -1);
+                llama_context_seq_rm(slot.ctx, slot.id, slot.prompt.tokens.pos_next(), -1);
 
                 for (size_t i = 0; i < ids.size(); ++i) {
                     completion_token_output result;
